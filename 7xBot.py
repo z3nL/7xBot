@@ -74,7 +74,11 @@ async def send_photo_prompt():
     await asyncio.sleep(300)
 
     if pending_users:
-        reminder_task = asyncio.create_task(reminder_loop(channel))
+        mentions = ' '.join([f'<@{uid}>' for uid in pending_users])
+        await channel.send(
+            f"⏰ Yo you guys missed it wyd {mentions}"
+        )
+        # reminder_task = asyncio.create_task(reminder_loop(channel))
 
 
 async def reminder_loop(channel):
@@ -144,7 +148,12 @@ async def before_scheduler():
 async def forceprompt(ctx):
     await send_photo_prompt()
 
-
+# Admin command to clear pending users
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def clear(ctx):
+    await pending_users.clear()
+    
 # Admin command to check who hasn't responded
 @bot.command()
 @commands.has_permissions(administrator=True)
