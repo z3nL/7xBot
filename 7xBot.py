@@ -2,7 +2,6 @@ from dotenv import load_dotenv
 import os
 import discord
 from discord.ext import commands, tasks
-import asyncio
 import random
 from datetime import datetime, timedelta
 import pytz
@@ -25,9 +24,9 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-pending_users = set()
 photo_session_active = False
-reminder_task = None
+submitted_users = set()
+user_streaks = {}
 
 
 def get_random_ping_time():
@@ -48,7 +47,7 @@ def get_random_ping_time():
 
 
 async def send_photo_prompt():
-    global pending_users, photo_session_active, reminder_task
+    global photo_session_active, submitted_users, user_streaks
 
     channel = bot.get_channel(CHANNEL_ID)
     if channel is None:
@@ -58,34 +57,26 @@ async def send_photo_prompt():
         print("Channel is not a text channel.")
         return
     guild = channel.guild
-    pending_users = set()
 
-    for member in guild.members:
-        if not member.bot:
-            pending_users.add(member.id)
+    # Close the previous cycle before opening a new one.
+    if photo_session_active:
+        current_member_ids = {member.id for member in guild.members if not member.bot}
+
+        # Keep streak records only for current non-bot members.
+        user_streaks = {uid: user_streaks.get(uid, 0) for uid in current_member_ids}
+
+        for uid in current_member_ids:
+            if uid in submitted_users:
+                user_streaks[uid] = user_streaks.get(uid, 0) + 1
+            else:
+                user_streaks[uid] = 0
 
     photo_session_active = True
+    submitted_users = set()
 
     await channel.send(
         f"@everyone 📸 WYD RN SEND A PHOTOOOOO"
     )
-
-    # Wait 5 minutes for initial responses
-    await asyncio.sleep(300)
-
-    if pending_users:
-        reminder_task = asyncio.create_task(reminder_loop(channel))
-
-
-async def reminder_loop(channel):
-    global pending_users, photo_session_active
-
-    while pending_users and photo_session_active:
-        mentions = ' '.join([f'<@{uid}>' for uid in pending_users])
-        await channel.send(
-            f"⏰ Yo what y'all doin rn send a photo {mentions}"
-        )
-        await asyncio.sleep(900)  # 15 minutes
 
 
 @bot.event
@@ -96,24 +87,26 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    global pending_users, photo_session_active, reminder_task
+    global submitted_users
 
     if message.author.bot:
         return
 
-    if photo_session_active and message.channel.id == CHANNEL_ID:
-        if message.attachments:
-            for attachment in message.attachments:
-                if any(attachment.filename.lower().endswith(ext) for ext in ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'mp4', 'mov']):
-                    if message.author.id in pending_users:
-                        pending_users.discard(message.author.id)
-                        await message.add_reaction('✅')
+    if photo_session_active and message.channel.id == CHANNEL_ID and message.attachments:
+        valid_exts = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'mp4', 'mov'}
+        has_media = any(
+            attachment.filename.lower().rsplit('.', 1)[-1] in valid_exts
+            for attachment in message.attachments
+            if '.' in attachment.filename
+        )
 
-                        if not pending_users:
-                            photo_session_active = False
-                            if reminder_task:
-                                reminder_task.cancel()
-                            await message.channel.send("🎉 Great job guys")
+        if has_media and message.author.id not in submitted_users:
+            submitted_users.add(message.author.id)
+            preview_streak = user_streaks.get(message.author.id, 0) + 1
+            await message.add_reaction('✅')
+            await message.channel.send(
+                f"Nice <@{message.author.id}>. If you keep this up, your streak will be **{preview_streak}** after the next prompt."
+            )
 
     await bot.process_commands(message)
 
@@ -149,11 +142,34 @@ async def forceprompt(ctx):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def pending(ctx):
-    if pending_users:
-        mentions = ' '.join([f'<@{uid}>' for uid in pending_users])
+    if not photo_session_active:
+        await ctx.send("No active photo cycle right now.")
+        return
+
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel is None or not isinstance(channel, discord.TextChannel):
+        await ctx.send("Photo channel is unavailable.")
+        return
+
+    member_ids = {member.id for member in channel.guild.members if not member.bot}
+    missing_ids = sorted(member_ids - submitted_users)
+
+    if missing_ids:
+        mentions = ' '.join([f'<@{uid}>' for uid in missing_ids])
         await ctx.send(f"Still waiting on: {mentions}")
     else:
-        await ctx.send("No pending users!")
+        await ctx.send("Everyone has submitted for this cycle.")
+
+
+@bot.command()
+async def streak(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    current = user_streaks.get(target.id, 0)
+
+    if photo_session_active and target.id in submitted_users:
+        current += 1
+
+    await ctx.send(f"🔥 {target.display_name}'s current streak: **{current}**")
 
 
 bot.run(TOKEN)
