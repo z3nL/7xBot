@@ -1,10 +1,13 @@
 from dotenv import load_dotenv
 import os
+import asyncio
+import json
 import discord
 from discord.ext import commands, tasks
-import asyncio
 import random
 from datetime import datetime, timedelta
+from collections import Counter
+import re
 import pytz
 
 load_dotenv()
@@ -17,6 +20,11 @@ CHANNEL_ID = int(os.getenv("WYD_CHANNEL_ID") or 0)
 if CHANNEL_ID == 0:
     raise ValueError("WYD_CHANNEL_ID environment variable is not set or invalid.")
 
+CHANNEL_GENERAL = 1433550440649199879
+
+SUMMARY_CHANNEL_ID = CHANNEL_GENERAL
+SUMMARY_TRIGGER_COUNT = 25
+
 TIMEZONE = pytz.timezone('America/New_York')
 
 intents = discord.Intents.default()
@@ -25,9 +33,22 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-pending_users = set()
 photo_session_active = False
-reminder_task = None
+submitted_users = set()
+user_streaks = {}
+STREAKS_FILE = "photo_streaks.json"
+summary_message_count = 0
+summary_lock = asyncio.Lock()
+
+STOPWORDS = {
+    "the", "and", "for", "that", "this", "with", "you", "your", "are", "but", "not", "have",
+    "was", "were", "they", "their", "from", "just", "about", "what", "when", "where", "how",
+    "why", "can", "cant", "could", "would", "should", "will", "im", "its", "dont", "did", "didnt",
+    "got", "get", "like", "lol", "lmao", "bro", "nah", "yes", "no", "too", "very", "then",
+    "there", "here", "into", "out", "our", "yall", "rn", "wyd", "send", "photo", "photos", "a",
+    "an", "to", "of", "in", "on", "at", "is", "it", "be", "as", "or", "if", "we", "i", "u",
+    "me", "my", "so", "up", "do", "does", "did", "had", "has"
+}
 
 
 def get_random_ping_time():
@@ -47,8 +68,95 @@ def get_random_ping_time():
     return target
 
 
+def load_streaks():
+    if not os.path.exists(STREAKS_FILE):
+        return {}
+
+    try:
+        with open(STREAKS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    if not isinstance(raw, dict):
+        return {}
+
+    parsed = {}
+    for key, value in raw.items():
+        try:
+            uid = int(key)
+            streak_value = int(value)
+        except (TypeError, ValueError):
+            continue
+
+        parsed[uid] = max(0, streak_value)
+
+    return parsed
+
+
+def save_streaks(streaks):
+    serializable = {str(uid): int(value) for uid, value in streaks.items()}
+    with open(STREAKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, indent=2, sort_keys=True)
+
+
+def build_activity_summary(messages):
+    authors = Counter(msg.author.display_name for msg in messages)
+
+    # Extract meaningful words that are 3+ characters long
+    words = []
+    for msg in messages:
+        cleaned = re.findall(r"[A-Za-z']{3,}", msg.content.lower())
+        words.extend([word for word in cleaned if word not in STOPWORDS])
+
+    top_people = authors.most_common(3)
+    top_words = Counter(words).most_common(5)
+    media_count = sum(len(msg.attachments) for msg in messages)
+
+    people_line = ", ".join([f"{name} ({count})" for name, count in top_people]) or "No clear leaders"
+    words_line = ", ".join([word for word, _ in top_words]) or "No strong keywords"
+
+    return (
+        "📝 **Chat Summary (last 20 messages)**\n"
+        f"- Active people: {people_line}\n"
+        f"- Main topics/keywords: {words_line}\n"
+        f"- Media shared: {media_count} file(s)"
+    )
+
+
+async def maybe_post_channel_summary(message):
+    global summary_message_count
+
+    if message.author.bot or message.channel.id != SUMMARY_CHANNEL_ID:
+        return
+
+    summary_message_count += 1
+    if summary_message_count < SUMMARY_TRIGGER_COUNT:
+        return
+
+    async with summary_lock:
+        if summary_message_count < SUMMARY_TRIGGER_COUNT:
+            return
+
+        recent_messages = []
+        async for msg in message.channel.history(limit=75):
+            if msg.author.bot:
+                continue
+            recent_messages.append(msg)
+            if len(recent_messages) == SUMMARY_TRIGGER_COUNT:
+                break
+
+        if not recent_messages:
+            summary_message_count = 0
+            return
+
+        summary_text = build_activity_summary(list(reversed(recent_messages)))
+        await message.channel.send(summary_text)
+        summary_message_count = 0
+
+
 async def send_photo_prompt():
-    global pending_users, photo_session_active, reminder_task
+    global photo_session_active, submitted_users, user_streaks
 
     channel = bot.get_channel(CHANNEL_ID)
     if channel is None:
@@ -58,66 +166,64 @@ async def send_photo_prompt():
         print("Channel is not a text channel.")
         return
     guild = channel.guild
-    pending_users = set()
 
-    for member in guild.members:
-        if not member.bot:
-            pending_users.add(member.id)
+    # Close the previous cycle before opening a new one.
+    if photo_session_active:
+        current_member_ids = {member.id for member in guild.members if not member.bot}
+
+        # Keep streak records only for current non-bot members.
+        user_streaks = {uid: user_streaks.get(uid, 0) for uid in current_member_ids}
+
+        for uid in current_member_ids:
+            if uid in submitted_users:
+                user_streaks[uid] = user_streaks.get(uid, 0) + 1
+            else:
+                user_streaks[uid] = 0
+
+        save_streaks(user_streaks)
 
     photo_session_active = True
+    submitted_users = set()
 
     await channel.send(
         f"@everyone 📸 WYD RN SEND A PHOTOOOOO"
     )
 
-    # Wait 5 minutes for initial responses
-    await asyncio.sleep(300)
-
-    if pending_users:
-        mentions = ' '.join([f'<@{uid}>' for uid in pending_users])
-        await channel.send(
-            f"⏰ Yo you guys missed it wyd {mentions}"
-        )
-        # reminder_task = asyncio.create_task(reminder_loop(channel))
-
-
-async def reminder_loop(channel):
-    global pending_users, photo_session_active
-
-    while pending_users and photo_session_active:
-        mentions = ' '.join([f'<@{uid}>' for uid in pending_users])
-        await channel.send(
-            f"⏰ Yo what y'all doin rn send a photo {mentions}"
-        )
-        await asyncio.sleep(900)  # 15 minutes
-
 
 @bot.event
 async def on_ready():
+    global user_streaks
+
+    user_streaks = load_streaks()
+    print(f"Loaded {len(user_streaks)} streak records.")
     print(f'Logged in as {bot.user}')
     scheduler.start()
 
 
 @bot.event
 async def on_message(message):
-    global pending_users, photo_session_active, reminder_task
+    global submitted_users
 
     if message.author.bot:
         return
 
-    if photo_session_active and message.channel.id == CHANNEL_ID:
-        if message.attachments:
-            for attachment in message.attachments:
-                if any(attachment.filename.lower().endswith(ext) for ext in ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'mp4', 'mov']):
-                    if message.author.id in pending_users:
-                        pending_users.discard(message.author.id)
-                        await message.add_reaction('✅')
+    if photo_session_active and message.channel.id == CHANNEL_ID and message.attachments:
+        valid_exts = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'mp4', 'mov'}
+        has_media = any(
+            attachment.filename.lower().rsplit('.', 1)[-1] in valid_exts
+            for attachment in message.attachments
+            if '.' in attachment.filename
+        )
 
-                        if not pending_users:
-                            photo_session_active = False
-                            if reminder_task:
-                                reminder_task.cancel()
-                            await message.channel.send("🎉 Great job guys")
+        if has_media and message.author.id not in submitted_users:
+            submitted_users.add(message.author.id)
+            preview_streak = user_streaks.get(message.author.id, 0) + 1
+            await message.add_reaction('✅')
+            await message.channel.send(
+                f"Nice <@{message.author.id}>. If you keep this up, your streak will be **{preview_streak}** after the next prompt."
+            )
+
+    await maybe_post_channel_summary(message)
 
     await bot.process_commands(message)
 
@@ -158,11 +264,34 @@ async def clear(ctx):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def pending(ctx):
-    if pending_users:
-        mentions = ' '.join([f'<@{uid}>' for uid in pending_users])
+    if not photo_session_active:
+        await ctx.send("No active photo cycle right now.")
+        return
+
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel is None or not isinstance(channel, discord.TextChannel):
+        await ctx.send("Photo channel is unavailable.")
+        return
+
+    member_ids = {member.id for member in channel.guild.members if not member.bot}
+    missing_ids = sorted(member_ids - submitted_users)
+
+    if missing_ids:
+        mentions = ' '.join([f'<@{uid}>' for uid in missing_ids])
         await ctx.send(f"Still waiting on: {mentions}")
     else:
-        await ctx.send("No pending users!")
+        await ctx.send("Everyone has submitted for this cycle.")
+
+
+@bot.command()
+async def streak(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    current = user_streaks.get(target.id, 0)
+
+    if photo_session_active and target.id in submitted_users:
+        current += 1
+
+    await ctx.send(f"🔥 {target.display_name}'s current streak: **{current}**")
 
 
 bot.run(TOKEN)
