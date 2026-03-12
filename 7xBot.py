@@ -254,7 +254,12 @@ async def before_scheduler():
 async def forceprompt(ctx):
     await send_photo_prompt()
 
-
+# Admin command to clear pending users
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def clear(ctx):
+    await pending_users.clear()
+    
 # Admin command to check who hasn't responded
 @bot.command()
 @commands.has_permissions(administrator=True)
