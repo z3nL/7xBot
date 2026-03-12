@@ -20,7 +20,9 @@ CHANNEL_ID = int(os.getenv("WYD_CHANNEL_ID") or 0)
 if CHANNEL_ID == 0:
     raise ValueError("WYD_CHANNEL_ID environment variable is not set or invalid.")
 
-SUMMARY_CHANNEL_ID = 1433550440649199879
+CHANNEL_GENERAL = 1433550440649199879
+
+SUMMARY_CHANNEL_ID = CHANNEL_GENERAL
 SUMMARY_TRIGGER_COUNT = 25
 
 TIMEZONE = pytz.timezone('America/New_York')
@@ -101,6 +103,7 @@ def save_streaks(streaks):
 def build_activity_summary(messages):
     authors = Counter(msg.author.display_name for msg in messages)
 
+    # Extract meaningful words that are 3+ characters long
     words = []
     for msg in messages:
         cleaned = re.findall(r"[A-Za-z']{3,}", msg.content.lower())
