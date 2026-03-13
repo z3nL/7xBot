@@ -1,0 +1,13 @@
+{
+  "name": "7xbot",
+  "version": "1.0.0",
+  "main": "7xBot.js",
+  "scripts": {
+    "start": "node 7xBot.js"
+  },
+  "dependencies": {
+    "@huggingface/inference": "^2.0.0",
+    "discord.js": "^14.0.0",
+    "dotenv": "^16.0.0"
+  }
+}
