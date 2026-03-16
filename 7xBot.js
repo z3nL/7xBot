@@ -37,6 +37,7 @@ let submittedUsers = new Set();
 let userStreaks = {};
 let summaryMessageCount = 0;
 let nextPingTime = null;
+let isSendingPrompt = false;
 
 // Returns a Date whose local fields reflect the current time in the Eastern timezone.
 function getNowET() {
@@ -54,6 +55,22 @@ function getRandomPingTime() {
     if (target <= now) {
         target.setDate(target.getDate() + 1);
     }
+    return target;
+}
+
+function getNextDailyPingTime(forceTomorrow = false) {
+    const now = getNowET();
+    const hour = Math.floor(Math.random() * 5) + 18; // 18–22
+    const minute = Math.floor(Math.random() * 60);
+
+    const target = new Date(now);
+    target.setHours(hour, minute, 0, 0);
+
+    // On startup, allow today if still upcoming. After a sent prompt, always use tomorrow.
+    if (forceTomorrow || target <= now) {
+        target.setDate(target.getDate() + 1);
+    }
+
     return target;
 }
 
@@ -165,10 +182,11 @@ async function sendPhotoPrompt() {
 
         const newStreaks = {};
         for (const uid of currentMemberIds) {
-            if (submittedUsers.has(uid)) {
-                newStreaks[uid] = (userStreaks[uid] ?? 0) + 1;
-            } else {
+            // Streaks are awarded immediately on upload; only reset misses at cycle boundary.
+            if (!submittedUsers.has(uid)) {
                 newStreaks[uid] = 0;
+            } else {
+                newStreaks[uid] = userStreaks[uid] ?? 0;
             }
         }
         userStreaks = newStreaks;
@@ -186,15 +204,23 @@ client.once('ready', () => {
     console.log(`Loaded ${Object.keys(userStreaks).length} streak records.`);
     console.log(`Logged in as ${client.user.tag}`);
 
-    nextPingTime = getRandomPingTime();
+    nextPingTime = getNextDailyPingTime();
     console.log(`First ping scheduled for: ${nextPingTime}`);
 
     setInterval(async () => {
         const now = getNowET();
+        if (isSendingPrompt) return;
         if (now >= nextPingTime) {
-            await sendPhotoPrompt();
-            nextPingTime = getRandomPingTime();
-            console.log(`Next ping scheduled for: ${nextPingTime}`);
+            isSendingPrompt = true;
+            try {
+                await sendPhotoPrompt();
+            } catch (err) {
+                console.error('Failed to send photo prompt:', err);
+            } finally {
+                nextPingTime = getNextDailyPingTime(true);
+                console.log(`Next ping scheduled for: ${nextPingTime}`);
+                isSendingPrompt = false;
+            }
         }
     }, 60_000);
 });
@@ -205,16 +231,19 @@ client.on('messageCreate', async (message) => {
     if (photoSessionActive && message.channel.id === CHANNEL_ID && message.attachments.size > 0) {
         const validExts = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'mp4', 'mov']);
         const hasMedia = message.attachments.some(att => {
-            const ext = att.filename.toLowerCase().split('.').pop();
-            return validExts.has(ext);
+            const fileName = att.filename?.toLowerCase() ?? '';
+            const ext = fileName.includes('.') ? fileName.split('.').pop() : '';
+            const contentType = (att.contentType ?? '').toLowerCase();
+            return validExts.has(ext) || contentType.startsWith('image/') || contentType.startsWith('video/');
         });
 
         if (hasMedia && !submittedUsers.has(message.author.id)) {
             submittedUsers.add(message.author.id);
-            const previewStreak = (userStreaks[message.author.id] ?? 0) + 1;
+            userStreaks[message.author.id] = (userStreaks[message.author.id] ?? 0) + 1;
+            saveStreaks(userStreaks);
             await message.react('✅');
             await message.channel.send(
-                `Nice <@${message.author.id}>. If you keep this up, your streak will be **${previewStreak}** after the next prompt.`
+                `Nice <@${message.author.id}>. Your streak is now **${userStreaks[message.author.id]}**.`
             );
         }
     }
@@ -269,10 +298,7 @@ client.on('messageCreate', async (message) => {
             if (found) target = found;
         }
 
-        let current = userStreaks[target.id] ?? 0;
-        if (photoSessionActive && submittedUsers.has(target.id)) {
-            current += 1;
-        }
+        const current = userStreaks[target.id] ?? 0;
 
         await message.channel.send(`🔥 ${target.displayName}'s current streak: **${current}**`);
     }
