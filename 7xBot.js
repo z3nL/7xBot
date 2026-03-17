@@ -44,20 +44,6 @@ function getNowET() {
     return new Date(new Date().toLocaleString('en-US', { timeZone: TIMEZONE }));
 }
 
-function getRandomPingTime() {
-    const now = getNowET();
-    const hour = Math.floor(Math.random() * 5) + 18; // 18–22
-    const minute = Math.floor(Math.random() * 60);
-
-    const target = new Date(now);
-    target.setHours(hour, minute, 0, 0);
-
-    if (target <= now) {
-        target.setDate(target.getDate() + 1);
-    }
-    return target;
-}
-
 function getNextDailyPingTime(forceTomorrow = false) {
     const now = getNowET();
     const hour = Math.floor(Math.random() * 5) + 18; // 18–22
@@ -72,6 +58,19 @@ function getNextDailyPingTime(forceTomorrow = false) {
     }
 
     return target;
+}
+
+function formatEtDate(date) {
+    return date.toLocaleString('en-US', {
+        timeZone: TIMEZONE,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true,
+    });
 }
 
 function loadStreaks() {
@@ -167,10 +166,10 @@ async function maybePostChannelSummary(message) {
 }
 
 async function sendPhotoPrompt() {
-    const channel = client.channels.cache.get(CHANNEL_ID);
+    const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
     if (!channel || channel.type !== ChannelType.GuildText) {
         console.log('Channel not found or not a text channel.');
-        return;
+        return false;
     }
     const guild = channel.guild;
 
@@ -197,6 +196,7 @@ async function sendPhotoPrompt() {
     submittedUsers = new Set();
 
     await channel.send('@everyone 📸 WYD RN SEND A PHOTOOOOO');
+    return true;
 }
 
 client.once('ready', () => {
@@ -205,7 +205,7 @@ client.once('ready', () => {
     console.log(`Logged in as ${client.user.tag}`);
 
     nextPingTime = getNextDailyPingTime();
-    console.log(`First ping scheduled for: ${nextPingTime}`);
+    console.log(`First ping scheduled for (ET): ${formatEtDate(nextPingTime)}`);
 
     setInterval(async () => {
         const now = getNowET();
@@ -213,12 +213,20 @@ client.once('ready', () => {
         if (now >= nextPingTime) {
             isSendingPrompt = true;
             try {
-                await sendPhotoPrompt();
+                const sent = await sendPhotoPrompt();
+                if (sent) {
+                    nextPingTime = getNextDailyPingTime(true);
+                    console.log(`Next ping scheduled for (ET): ${formatEtDate(nextPingTime)}`);
+                } else {
+                    // Keep cadence daily-only. If a send fails, do not create extra cycles.
+                    nextPingTime = getNextDailyPingTime(true);
+                    console.log(`Prompt send failed; next daily ping remains (ET): ${formatEtDate(nextPingTime)}`);
+                }
             } catch (err) {
                 console.error('Failed to send photo prompt:', err);
-            } finally {
                 nextPingTime = getNextDailyPingTime(true);
-                console.log(`Next ping scheduled for: ${nextPingTime}`);
+                console.log(`Send errored; next daily ping remains (ET): ${formatEtDate(nextPingTime)}`);
+            } finally {
                 isSendingPrompt = false;
             }
         }
@@ -260,6 +268,14 @@ client.on('messageCreate', async (message) => {
     if (command === 'forceprompt') {
         if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) return;
         await sendPhotoPrompt();
+
+    } else if (command === 'nextping') {
+        if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) return;
+        if (!nextPingTime) {
+            await message.channel.send('No ping is currently scheduled.');
+            return;
+        }
+        await message.channel.send(`Next prompt is scheduled for **${formatEtDate(nextPingTime)} ET**.`);
 
     } else if (command === 'pending') {
         if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) return;
