@@ -7,15 +7,14 @@ const {
     ChannelType,
 } = require('discord.js');
 const fs = require('fs');
-const { HfInference } = require('@huggingface/inference');
-
-const hf = new HfInference(process.env.HF_TOKEN);
 
 const TOKEN = process.env.DISCORD_TOKEN;
 if (!TOKEN) throw new Error('DISCORD_TOKEN environment variable is not set.');
 
 const CHANNEL_ID = process.env.WYD_CHANNEL_ID;
 if (!CHANNEL_ID) throw new Error('WYD_CHANNEL_ID environment variable is not set or invalid.');
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_SUMMARY_MODEL = process.env.GROQ_SUMMARY_MODEL || 'llama-3.1-8b-instant';
 
 const CHANNEL_GENERAL = '1433550440649199879';
 const SUMMARY_CHANNEL_ID = CHANNEL_GENERAL;
@@ -99,6 +98,71 @@ function saveStreaks(streaks) {
     fs.writeFileSync(STREAKS_FILE, JSON.stringify(serializable, null, 2));
 }
 
+function buildSummaryInput(messages) {
+    return messages
+        .map(msg => {
+            const name = msg.member?.displayName ?? msg.author.username;
+            const content = (msg.content ?? '').trim();
+            return `${name}: ${content}`;
+        })
+        .filter(line => line.trim().length > 3)
+        .join('\n')
+        .slice(0, 6000);
+}
+
+async function summarizeWithGroq(messages) {
+    if (!GROQ_API_KEY) {
+        return 'Groq summarizer is not configured. Set GROQ_API_KEY in your .env file.';
+    }
+
+    if (typeof fetch !== 'function') {
+        return 'Groq summarizer requires Node.js 18+ (global fetch is unavailable).';
+    }
+
+    const chatText = buildSummaryInput(messages);
+    if (!chatText) {
+        return 'No meaningful text was found in the recent messages to summarize.';
+    }
+
+    try {
+        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${GROQ_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: GROQ_SUMMARY_MODEL,
+                temperature: 0.2,
+                max_tokens: 120,
+                messages: [
+                    {
+                        role: 'system',
+                        content: 'You summarize group chats. Return exactly 1-2 concise sentences and keep slang/context intact.'
+                    },
+                    {
+                        role: 'user',
+                        content: `Summarize this Discord chat:\n\n${chatText}`,
+                    },
+                ],
+            }),
+        });
+
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const apiError = data?.error?.message || `HTTP ${response.status}`;
+            return `Groq summarization failed: ${apiError}`;
+        }
+
+        const summary = data?.choices?.[0]?.message?.content?.trim();
+        if (!summary) return 'Groq summarization returned an empty response.';
+
+        return summary;
+    } catch (err) {
+        return `Groq summarization failed: ${err.message}`;
+    }
+}
+
 async function buildActivitySummary(messages) {
     const authorCounts = {};
     for (const msg of messages) {
@@ -113,27 +177,7 @@ async function buildActivitySummary(messages) {
 
     const peopleLine = topPeople.join(', ') || 'No clear leaders';
 
-    const chatText = messages
-        .map(msg => {
-            const name = msg.member?.displayName ?? msg.author.username;
-            return `${name}: ${msg.content}`;
-        })
-        .filter(line => line.trim().length > 3)
-        .join(' ');
-
-    let summaryLine = 'No summary available.';
-    if (chatText.length > 20) {
-        try {
-            const result = await hf.summarization({
-                model: 'facebook/bart-large-cnn',
-                inputs: chatText.slice(0, 1024),
-                parameters: { max_length: 60, min_length: 15 },
-            });
-            summaryLine = result.summary_text;
-        } catch (err) {
-            console.error('HuggingFace summarization failed:', err.message);
-        }
-    }
+    const summaryLine = await summarizeWithGroq(messages);
 
     return (
         `📝 **Chat Summary (last ${messages.length} messages)**\n` +
