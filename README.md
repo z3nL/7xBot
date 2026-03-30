@@ -8,6 +8,14 @@
 ### `!streak @member`
 - Shows streak for a tagged member.
 
+### `!summary 30|60|120`
+- Summarizes the last 30, 60, or 120 non-bot messages in the current channel.
+
+### `!summary <amount> <unit>`
+- Summarizes messages since a time window like `!summary 25 m` or `!summary 2 hr`.
+- Supported units: `m|min|mins|minute|minutes`, `h|hr|hrs|hour|hours`, `d|day|days`.
+- If there are no user messages in the selected window, the bot replies with `none`.
+
 ## Environment Variables
 
 Create a `.env` file with:

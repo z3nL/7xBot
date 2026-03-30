@@ -16,9 +16,6 @@ if (!CHANNEL_ID) throw new Error('WYD_CHANNEL_ID environment variable is not set
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_SUMMARY_MODEL = process.env.GROQ_SUMMARY_MODEL || 'llama-3.1-8b-instant';
 
-const CHANNEL_GENERAL = '1433550440649199879';
-const SUMMARY_CHANNEL_ID = CHANNEL_GENERAL;
-const SUMMARY_TRIGGER_COUNT = 30;
 const STREAKS_FILE = 'photo_streaks.json';
 const TIMEZONE = 'America/New_York';
 
@@ -34,7 +31,6 @@ const client = new Client({
 let photoSessionActive = false;
 let submittedUsers = new Set();
 let userStreaks = {};
-let summaryMessageCount = 0;
 let nextPingTime = null;
 let isSendingPrompt = false;
 
@@ -163,7 +159,7 @@ async function summarizeWithGroq(messages) {
     }
 }
 
-async function buildActivitySummary(messages) {
+async function buildActivitySummary(messages, scopeLabel) {
     const authorCounts = {};
     for (const msg of messages) {
         const name = msg.member?.displayName ?? msg.author.username;
@@ -180,33 +176,127 @@ async function buildActivitySummary(messages) {
     const summaryLine = await summarizeWithGroq(messages);
 
     return (
-        `📝 **Chat Summary (last ${messages.length} messages)**\n` +
+        `📝 **Chat Summary (${scopeLabel})**\n` +
         `- Active people: ${peopleLine}\n` +
         `- Summary: ${summaryLine}`
     );
 }
 
-async function maybePostChannelSummary(message) {
-    if (message.author.bot || message.channel.id !== SUMMARY_CHANNEL_ID) return;
+async function fetchRecentUserMessagesByCount(channel, count) {
+    const target = Math.max(1, count);
+    const out = [];
+    let before;
 
-    summaryMessageCount++;
-    if (summaryMessageCount < SUMMARY_TRIGGER_COUNT) return;
+    while (out.length < target) {
+        const remaining = target - out.length;
+        const batchSize = Math.min(100, Math.max(remaining * 2, 25));
+        const fetched = await channel.messages.fetch({ limit: batchSize, before });
+        if (!fetched.size) break;
 
-    // Reset before async work to prevent double-triggering.
-    summaryMessageCount = 0;
+        for (const msg of fetched.values()) {
+            if (msg.author.bot) continue;
+            out.push(msg);
+            if (out.length === target) break;
+        }
 
-    const fetched = await message.channel.messages.fetch({ limit: 75 });
-    const recentMessages = [];
-    for (const msg of fetched.values()) {
-        if (msg.author.bot) continue;
-        recentMessages.push(msg);
-        if (recentMessages.length === SUMMARY_TRIGGER_COUNT) break;
+        before = fetched.last()?.id;
+        if (!before) break;
     }
 
-    if (!recentMessages.length) return;
+    return out.reverse();
+}
 
-    const summaryText = await buildActivitySummary(recentMessages.reverse());
-    await message.channel.send(summaryText);
+async function fetchRecentUserMessagesSince(channel, sinceDate) {
+    const out = [];
+    let before;
+
+    while (true) {
+        const fetched = await channel.messages.fetch({ limit: 100, before });
+        if (!fetched.size) break;
+
+        let reachedOlderThanWindow = false;
+        for (const msg of fetched.values()) {
+            if (msg.createdAt < sinceDate) {
+                reachedOlderThanWindow = true;
+                continue;
+            }
+            if (!msg.author.bot) out.push(msg);
+        }
+
+        if (reachedOlderThanWindow) break;
+
+        before = fetched.last()?.id;
+        if (!before) break;
+    }
+
+    return out.reverse();
+}
+
+function parseSummaryWindow(args) {
+    if (!args.length) {
+        return {
+            ok: true,
+            mode: 'count',
+            count: 30,
+            scopeLabel: 'last 30 messages',
+        };
+    }
+
+    const [firstRaw, secondRaw] = args;
+    const first = firstRaw.toLowerCase();
+    const second = (secondRaw ?? '').toLowerCase();
+
+    if (['30', '60', '120'].includes(first) && args.length === 1) {
+        const count = parseInt(first, 10);
+        return {
+            ok: true,
+            mode: 'count',
+            count,
+            scopeLabel: `last ${count} messages`,
+        };
+    }
+
+    let amount;
+    let unit;
+
+    const compact = first.match(/^(\d+)\s*([a-z]+)$/i);
+    if (compact && args.length === 1) {
+        amount = parseInt(compact[1], 10);
+        unit = compact[2].toLowerCase();
+    } else if (/^\d+$/.test(first) && args.length >= 2) {
+        amount = parseInt(first, 10);
+        unit = second;
+    }
+
+    if (!amount || amount <= 0 || !unit) {
+        return {
+            ok: false,
+            error: 'Usage: `!summary 30|60|120` or `!summary <number> <m|min|h|hr|d|day>` (example: `!summary 25 m`, `!summary 2 hr`).',
+        };
+    }
+
+    let multiplierMs;
+    if (['m', 'min', 'mins', 'minute', 'minutes'].includes(unit)) {
+        multiplierMs = 60_000;
+    } else if (['h', 'hr', 'hrs', 'hour', 'hours'].includes(unit)) {
+        multiplierMs = 3_600_000;
+    } else if (['d', 'day', 'days'].includes(unit)) {
+        multiplierMs = 86_400_000;
+    } else {
+        return {
+            ok: false,
+            error: 'Unknown time unit. Use minutes (`m`), hours (`hr`), or days (`d`).',
+        };
+    }
+
+    const since = new Date(Date.now() - amount * multiplierMs);
+    const unitLabel = unit;
+    return {
+        ok: true,
+        mode: 'time',
+        since,
+        scopeLabel: `since ${amount} ${unitLabel} ago`,
+    };
 }
 
 async function sendPhotoPrompt() {
@@ -300,8 +390,6 @@ client.on('messageCreate', async (message) => {
         }
     }
 
-    await maybePostChannelSummary(message);
-
     // Command handling
     const PREFIX = '!';
     if (!message.content.startsWith(PREFIX)) return;
@@ -361,6 +449,28 @@ client.on('messageCreate', async (message) => {
         const current = userStreaks[target.id] ?? 0;
 
         await message.channel.send(`🔥 ${target.displayName}'s current streak: **${current}**`);
+
+    } else if (command === 'summary') {
+        const parsed = parseSummaryWindow(args);
+        if (!parsed.ok) {
+            await message.channel.send(parsed.error);
+            return;
+        }
+
+        let messagesToSummarize = [];
+        if (parsed.mode === 'count') {
+            messagesToSummarize = await fetchRecentUserMessagesByCount(message.channel, parsed.count);
+        } else {
+            messagesToSummarize = await fetchRecentUserMessagesSince(message.channel, parsed.since);
+        }
+
+        if (!messagesToSummarize.length) {
+            await message.channel.send('none');
+            return;
+        }
+
+        const summaryText = await buildActivitySummary(messagesToSummarize, parsed.scopeLabel);
+        await message.channel.send(summaryText);
     }
 });
 
